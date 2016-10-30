@@ -12,6 +12,71 @@
 
 # Enable -Verbose option
 [CmdletBinding()]
+Param()
+
+# functions used to version SQL Server Database Projects
+# 
+function Get-XmlNode([ xml ]$XmlDocument, [string]$NodePath, [string]$NamespaceURI = "", [string]$NodeSeparatorCharacter = '.') 
+{     
+    # If a Namespace URI was not given, use the Xml document's default namespace.     
+    if ([string]::IsNullOrEmpty($NamespaceURI)) 
+    { 
+        $NamespaceURI = $XmlDocument.DocumentElement.NamespaceURI 
+    }              
+    # In order for SelectSingleNode() to actually work, we need to use the fully qualified node path along with an Xml Namespace Manager, so set them up.     
+    $xmlNsManager = New-Object System.Xml.XmlNamespaceManager($XmlDocument.NameTable)     
+    $xmlNsManager.AddNamespace("ns", $NamespaceURI)     
+    $fullyQualifiedNodePath = "/ns:$($NodePath.Replace($($NodeSeparatorCharacter), '/ns:'))"          
+    # Try and get the node, then return it. Returns $null if the node was not found.     
+    $node = $XmlDocument.SelectSingleNode($fullyQualifiedNodePath, $xmlNsManager)     
+    return $node
+}
+
+function Get-XmlElementsTextValue([ xml ]$XmlDocument, [string]$ElementPath, [string]$NamespaceURI = "", [string]$NodeSeparatorCharacter = '.') 
+{     
+    # Try and get the node.      
+    $node = Get-XmlNode -XmlDocument $XmlDocument -NodePath $ElementPath -NamespaceURI $NamespaceURI -NodeSeparatorCharacter $NodeSeparatorCharacter          
+    # If the node already exists, return its value, otherwise return null.     
+    if ($node) 
+    { 
+        return $node.InnerText 
+    } 
+    else 
+    { 
+        return $null 
+    } 
+}   
+
+function Set-XmlElementsTextValue([ xml ]$XmlDocument, [string]$ElementPath, [string]$TextValue, [string]$NamespaceURI = "", [string]$NodeSeparatorCharacter = '.') 
+{     
+    # Try and get the node.      
+    $node = Get-XmlNode -XmlDocument $XmlDocument -NodePath $ElementPath -NamespaceURI $NamespaceURI -NodeSeparatorCharacter $NodeSeparatorCharacter          
+    # If the node already exists, update its value.     
+    if ($node)     
+    {          
+        $node.InnerText = $TextValue    
+    }     
+    # Else the node doesn't exist yet, so create it with the given value.     
+    else     
+    {         
+        # Create the new element with the given value.         
+        $elementName = $ElementPath.SubString($ElementPath.LastIndexOf($NodeSeparatorCharacter) + 1)         
+        $element = $XmlDocument.CreateElement($elementName, $XmlDocument.DocumentElement.NamespaceURI)               
+        $textNode = $XmlDocument.CreateTextNode($TextValue)         
+        $element.AppendChild($textNode) > $null                  
+        # Try and get the parent node.         
+        $parentNodePath = $ElementPath.SubString(0, $ElementPath.LastIndexOf($NodeSeparatorCharacter))         
+        $parentNode = Get-XmlNode -XmlDocument $XmlDocument -NodePath $parentNodePath -NamespaceURI $NamespaceURI -NodeSeparatorCharacter $NodeSeparatorCharacter                  
+        if ($parentNode)         
+        {             
+            $parentNode.AppendChild($element) > $null        
+        }         
+        else         
+        {             
+            throw "$parentNodePath does not exist in the xml."        
+        }     
+    }
+} 
 
 # Regular expression pattern to find the version in the build number 
 # and then apply it to the assemblies
@@ -87,5 +152,28 @@ if($files)
 }
 else
 {
-    Write-Warning "Found no files."
+    Write-Warning "Found no *.AssemblyInfo files."
+}
+
+# Put the version/description in the DacVersion/DacDescription elements in the .sqlproj (SSDT) project files
+$files = gci $Env:BUILD_SOURCESDIRECTORY -recurse | 
+	?{ $_.Extension -eq ".sqlproj" } | 
+	foreach { gci -Path $_.FullName -Recurse -include *.sqlproj }
+if($files)
+{
+	Write-Verbose "Will apply $NewVersion to $($files.count) files."
+	
+	foreach ($file in $files) {	
+		[xml]$fileContent = Get-Content($file)            
+	    attrib $file -r
+		# Read in the file contents, update the version element's value, and save the file. 
+        Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.DacVersion" -TextValue $NewVersion
+        Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.DacDescription" -TextValue $Env:BUILD_BUILDNUMBER
+        $fileContent.Save($file)            
+	    Write-Verbose "$file.FullName - version applied"		
+	}
+}
+else
+{
+	Write-Warning "Found no *.sqlproj files."
 }
