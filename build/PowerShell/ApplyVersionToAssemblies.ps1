@@ -9,10 +9,21 @@
 # then your build numbers come out like this:
 # "Build HelloWorld_2013.07.19.1"
 # This script would then apply version 2013.07.19.1 to your assemblies.
+# If used for preview versions of NuGet packages then using the parameters -suffix $(Release.EnvironmentName) -semVer "2.0"
+# would result in a package named like this ContosoLogger.Library.0.1.18076-alpha.1.nupkg being pushed to the feed
+# To push a production version of the package call the script without any parameters
 
 # Enable -Verbose option
 [CmdletBinding()]
-Param()
+Param(
+    [string]$suffix="",
+    [ValidateSet("1.0","2.0")][string] $semVer = "2.0",
+    [Switch] $AssemblyVersion,
+    [Switch] $AssemblyFileVersion,
+    [Switch] $AssemblyInformationalVersion,
+    [Switch] $DotNetCore,
+    [Switch] $NuGetVersion
+)
 
 # functions used to version SQL Server Database Projects
 # 
@@ -81,10 +92,14 @@ function Set-XmlElementsTextValue([ xml ]$XmlDocument, [string]$ElementPath, [st
 # Regular expression pattern to find the version in the build number 
 # and then apply it to the assemblies
 $VersionRegex = "\d+\.\d+\.\d+\.\d+"
+$artifactsDirectory = ""
+$FileVersionRegex = "AssemblyFileVersion\((.+)\)"
+$InformationalVersionRegex = "AssemblyInformationalVersion\((.+)\)"
+$AssemblyVersionRegex = "AssemblyVersion\((.+)\)"
 
 # If this script is not running on a build server, remind user to 
 # set environment variables so that this script can be debugged
-if(-not ($Env:BUILD_SOURCESDIRECTORY -and $Env:BUILD_BUILDNUMBER))
+if(-not ($Env:BUILD_SOURCESDIRECTORY -and $Env:BUILD_BUILDNUMBER) -and -not ($Env:AGENT_RELEASEDIRECTORY -and $Env:BUILD_BUILDNUMBER))
 {
     Write-Error "You must set the following environment variables"
     Write-Error "to test this script interactively."
@@ -95,18 +110,39 @@ if(-not ($Env:BUILD_SOURCESDIRECTORY -and $Env:BUILD_BUILDNUMBER))
     exit 1
 }
 
-# Make sure path to source code directory is available
-if (-not $Env:BUILD_SOURCESDIRECTORY)
+if (-not $Env:AGENT_RELEASEDIRECTORY) 
 {
-    Write-Error ("BUILD_SOURCESDIRECTORY environment variable is missing.")
-    exit 1
+
+    # Make sure path to source code directory is available
+    if (-not $Env:BUILD_SOURCESDIRECTORY)
+    {
+        Write-Error ("BUILD_SOURCESDIRECTORY environment variable is missing.")
+        exit 1
+    }
+    elseif (-not (Test-Path $Env:BUILD_SOURCESDIRECTORY))
+    {
+        Write-Error "BUILD_SOURCESDIRECTORY does not exist: $Env:BUILD_SOURCESDIRECTORY"
+        exit 1
+    }
+    Write-Verbose "BUILD_SOURCESDIRECTORY: $Env:BUILD_SOURCESDIRECTORY"
+    $artifactsDirectory = $Env:BUILD_SOURCESDIRECTORY
 }
-elseif (-not (Test-Path $Env:BUILD_SOURCESDIRECTORY))
+else 
 {
-    Write-Error "BUILD_SOURCESDIRECTORY does not exist: $Env:BUILD_SOURCESDIRECTORY"
-    exit 1
+    # Make sure path to source code directory is available
+    if (-not $Env:AGENT_RELEASEDIRECTORY)
+    {
+        Write-Error ("AGENT_RELEASEDIRECTORY environment variable is missing.")
+        exit 1
+    }
+    elseif (-not (Test-Path $Env:AGENT_RELEASEDIRECTORY))
+    {
+        Write-Error "AGENT_RELEASEDIRECTORY does not exist: $Env:AGENT_RELEASEDIRECTORY"
+        exit 1
+    }
+    Write-Verbose "AGENT_RELEASEDIRECTORY: $Env:AGENT_RELEASEDIRECTORY"
+    $artifactsDirectory = $Env:AGENT_RELEASEDIRECTORY
 }
-Write-Verbose "BUILD_SOURCESDIRECTORY: $Env:BUILD_SOURCESDIRECTORY"
 
 # Make sure there is a build number
 if (-not $Env:BUILD_BUILDNUMBER)
@@ -114,6 +150,17 @@ if (-not $Env:BUILD_BUILDNUMBER)
     Write-Error ("BUILD_BUILDNUMBER environment variable is missing.")
     exit 1
 }
+
+if ($Env:BUILD_REPOSITORY_PROVIDER -like "*git*")
+{
+    $GIT_TAG = git describe --tags
+
+    if (-not $GIT_TAG -eq "")
+    {      
+      echo "##vso[task.setvariable variable=GIT_TAG]$GIT_TAG"
+    }
+}
+
 Write-Verbose "BUILD_BUILDNUMBER: $Env:BUILD_BUILDNUMBER"
 
 # Get and validate the version data
@@ -136,7 +183,7 @@ $NewVersion = $VersionData[0]
 Write-Verbose "Version: $NewVersion"
 
 # Apply the version to the assembly property files
-$files = gci $Env:BUILD_SOURCESDIRECTORY -recurse -include "*Properties*","My Project" | 
+$files = gci $artifactsDirectory -recurse -include "*Properties*","My Project" | 
     ?{ $_.PSIsContainer } | 
     foreach { gci -Path $_.FullName -Recurse -include AssemblyInfo.* }
 if($files)
@@ -145,8 +192,22 @@ if($files)
 
     foreach ($file in $files) {
         $filecontent = Get-Content($file)
-        attrib $file -r
-        $filecontent -replace $VersionRegex, $NewVersion | Out-File $file
+        if ($AssemblyInformationalVersion)
+        {
+          Write-Verbose "Updating AssemblyInformationalVersion(..)"  
+          $filecontent = $filecontent -replace $InformationalVersionRegex, "AssemblyInformationalVersion(`"$NewVersion-$GIT_TAG`")" 
+        }
+        if ($AssemblyFileVersion)
+        {
+            Write-Verbose "Updating AssemblyFileVersion(..)"
+            $filecontent = $filecontent -replace $FileVersionRegex, "AssemblyFileVersion(`"$NewVersion`")" 
+        }
+        if ($AssemblyVersion)
+        {
+            Write-Verbose "Updating AssemblyVersion(..)"
+            $filecontent = $filecontent -replace $AssemblyVersionRegex, "AssemblyVersion(`"$NewVersion`")" 
+        }
+        $filecontent | Out-File $file
         Write-Verbose "$file.FullName - version applied"
     }
 }
@@ -156,7 +217,7 @@ else
 }
 
 # Put the version/description in the DacVersion/DacDescription elements in the .sqlproj (SSDT) project files
-$files = gci $Env:BUILD_SOURCESDIRECTORY -recurse | 
+$files = gci $artifactsDirectory -recurse | 
 	?{ $_.Extension -eq ".sqlproj" } | 
 	foreach { gci -Path $_.FullName -Recurse -include *.sqlproj }
 if($files)
@@ -165,8 +226,7 @@ if($files)
 	
 	foreach ($file in $files) {	
 		[xml]$fileContent = Get-Content($file)            
-	    attrib $file -r
-		# Read in the file contents, update the version element's value, and save the file. 
+	    # Read in the file contents, update the version element's value, and save the file. 
         Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.DacVersion" -TextValue $NewVersion
         Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.DacDescription" -TextValue $Env:BUILD_BUILDNUMBER
         $fileContent.Save($file)            
@@ -176,4 +236,81 @@ if($files)
 else
 {
 	Write-Warning "Found no *.sqlproj files."
+}
+
+# check if user wants to use semantic versioning, by including a $suffix parameter.  We also check if we are using the SemVer 1.0 or 2.0 format
+$semanticVersion = ""
+if ($suffix -ne "")
+{
+  $vData = [regex]::matches($NewVersion, "\d+")
+  $majorVersion = $vData[0].Value
+  $minorVersion = $vData[1].Value
+  $buildVersion = $vData[2].Value
+  $revision = $vData[3].Value
+  
+  if ($semVer -eq "1.0")
+  {
+    $semanticVersion = $majorVersion +"." + $minorVersion + "." + $buildVersion + "-" + $suffix + $revision 
+  }
+  else 
+  {
+    $semanticVersion = $majorVersion +"." + $minorVersion + "." + $buildVersion + "-" + $suffix + "." + $revision
+  }
+  write-warning "Semantic Version: $semanticVersion"
+}
+else
+{
+  $semanticVersion = $newVersion  
+}
+
+# Put the version/description in the Version elements in the .nuspec (NuGet) files
+if ($NuGetVersion)
+{
+    $files = gci $artifactsDirectory -recurse | 
+        ?{ $_.Extension -eq ".nuspec" } | 
+        foreach { gci -Path $_.FullName -Recurse -include *.nuspec }
+    if($files)
+    {
+        Write-Verbose "Will apply $semanticVersion to $($files.count) files."
+        
+        foreach ($file in $files) 
+        {	
+            [xml]$fileContent = Get-Content($file)            
+            # Read in the file contents, update the version element's value, and save the file. 
+            Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "package.metadata.version" -TextValue $semanticVersion
+            $fileContent.Save($file)            
+            Write-Verbose "$file.FullName - version applied"		
+        }
+        Write-Host "##vso[task.setvariable variable=semanticVersion]$semanticVersion"
+    }
+    else
+    {
+        Write-Warning "Found no *.nuspec files."
+    }
+}
+
+# Put the version/description in the Version/AssemblyVersion/FileVersion elements in the .csproj .NET Core project files
+if ($dotNetCore)
+{
+    $files = gci $artifactsDirectory -recurse | 
+        ?{ $_.Extension -eq ".csproj" } | 
+        foreach { gci -Path $_.FullName -Recurse -include *.csproj }
+    if($files)
+    {
+        Write-Verbose "Will apply $NewVersion to $($files.count) files."
+        
+        foreach ($file in $files) {	
+            [xml]$fileContent = Get-Content($file)            
+            # Read in the file contents, update the version element's value, and save the file. 
+            Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.Version" -TextValue $NewVersion
+            Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.AssemblyVersion" -TextValue $NewVersion
+            Set-XmlElementsTextValue -XmlDocument $fileContent -ElementPath "Project.PropertyGroup.FileVersion" -TextValue $NewVersion
+            $fileContent.Save($file)            
+            Write-Verbose "$file.FullName - version applied"		
+        }
+    }
+    else
+    {
+        Write-Warning "Found no *.csproj files."
+    }
 }
